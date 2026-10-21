@@ -163,86 +163,107 @@ static bool w_contains_ci(const WCHAR* hay, const WCHAR* needle) {
     return false;
 }
 
+// v37 dump helper — writes a UTF-8 line to the given file handle
+static void dump_line_utf8(HANDLE hFile, const WCHAR* w) {
+    char buf[MAX_PATH * 2];
+    int bl = WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, sizeof(buf) - 2, nullptr, nullptr);
+    if (bl > 0) {
+        buf[bl - 1] = '\r';
+        buf[bl]     = '\n';
+        DWORD w2 = 0;
+        WriteFile(hFile, buf, bl + 1, &w2, nullptr);
+    }
+}
+
 bool FindLuaDll(HANDLE hProcess, LuaDllInfo* out) {
     HMODULE mods[1024];
     DWORD needed = 0;
     if (!EnumProcessModulesEx(hProcess, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) {
-        // Fallback: try without LIST_MODULES_ALL (older behaviour / bitness mismatch)
         if (!EnumProcessModules(hProcess, mods, sizeof(mods), &needed))
             return false;
     }
 
     DWORD count = needed / sizeof(HMODULE);
 
-    // Pass 1: exact name match (fastest, matches v34/known builds)
-    for (DWORD i = 0; i < count; i++) {
-        WCHAR name[MAX_PATH];
-        if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
-        WCHAR* base = wcsrchr(name, L'\\');
-        if (!base) base = name; else base++;
-
-        if (_wcsicmp(base, L"citizen-scripting-lua54.dll") == 0 ||
-            _wcsicmp(base, L"lua54.dll") == 0) {
-            MODULEINFO mi{};
-            GetModuleInformation(hProcess, mods[i], &mi, sizeof(mi));
-            out->hModule  = mods[i];
-            out->baseAddr = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
-            out->size     = mi.SizeOfImage;
-            return true;
-        }
-    }
-
-    // Pass 2: fuzzy match — any DLL whose BASENAME contains "lua54" or
-    // "scripting-lua" (covers builds where the DLL was renamed, e.g.
-    // "citizen-scripting-lua54-v2.dll", "scripting-lua54.dll", etc.)
-    for (DWORD i = 0; i < count; i++) {
-        WCHAR name[MAX_PATH];
-        if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
-        WCHAR* base = wcsrchr(name, L'\\');
-        if (!base) base = name; else base++;
-
-        if (w_contains_ci(base, L"lua54") ||
-            w_contains_ci(base, L"scripting-lua")) {
-            MODULEINFO mi{};
-            GetModuleInformation(hProcess, mods[i], &mi, sizeof(mi));
-            out->hModule  = mods[i];
-            out->baseAddr = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
-            out->size     = mi.SizeOfImage;
-            return true;
-        }
-    }
-
-    // Nothing matched — dump the module list to %TEMP%\fivem_modules.txt
-    // so the user can send us the DLL name their build is actually using.
+    // v37: ALWAYS dump the full module list AND the Lua-ish candidates to
+    // %TEMP%\fivem_modules.txt so we can see every candidate DLL at once.
     WCHAR dumpPath[MAX_PATH];
+    HANDLE hFile = INVALID_HANDLE_VALUE;
     DWORD tn = GetEnvironmentVariableW(L"TEMP", dumpPath, MAX_PATH);
     if (tn > 0 && tn < MAX_PATH - 32) {
         wcscat_s(dumpPath, MAX_PATH, L"\\fivem_modules.txt");
-        HANDLE hFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
-                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        hFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile != INVALID_HANDLE_VALUE) {
-            char header[128];
+            char header[256];
             int hl = snprintf(header, sizeof(header),
-                "FiveMMenu v37 FindLuaDll — nenhum DLL de Lua localizado.\r\n"
-                "Modulos enumerados no processo FiveM (%lu total):\r\n\r\n", count);
+                "FiveMMenu v37 FindLuaDll — %lu modulos no processo FiveM\r\n"
+                "═════════════════ CANDIDATOS LUA ═════════════════\r\n",
+                (unsigned long)count);
             DWORD w = 0;
             WriteFile(hFile, header, hl, &w, nullptr);
-
-            for (DWORD i = 0; i < count && i < 500; i++) {
-                WCHAR name[MAX_PATH];
-                if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
-                char buf[MAX_PATH * 2];
-                int bl = WideCharToMultiByte(CP_UTF8, 0, name, -1, buf, sizeof(buf) - 2, nullptr, nullptr);
-                if (bl > 0) {
-                    buf[bl - 1] = '\r';
-                    buf[bl]     = '\n';
-                    WriteFile(hFile, buf, bl + 1, &w, nullptr);
-                }
-            }
-            CloseHandle(hFile);
         }
     }
 
+    // Collect every DLL whose basename contains "lua", "scripting", or
+    // "citizen" so we can see all candidates in one place.
+    struct Cand { HMODULE mod; WCHAR path[MAX_PATH]; const WCHAR* base; };
+    Cand cands[32];
+    size_t candN = 0;
+
+    for (DWORD i = 0; i < count; i++) {
+        WCHAR name[MAX_PATH];
+        if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
+        WCHAR* base = wcsrchr(name, L'\\');
+        if (!base) base = name; else base++;
+
+        bool is_candidate = w_contains_ci(base, L"lua") ||
+                            w_contains_ci(base, L"scripting") ||
+                            w_contains_ci(base, L"citizen");
+        if (is_candidate && candN < 32) {
+            cands[candN].mod  = mods[i];
+            wcscpy_s(cands[candN].path, MAX_PATH, name);
+            cands[candN].base = cands[candN].path + (base - name);
+            candN++;
+            if (hFile != INVALID_HANDLE_VALUE) dump_line_utf8(hFile, name);
+        }
+    }
+
+    if (hFile != INVALID_HANDLE_VALUE) {
+        const char sep[] = "═════════════════ TODOS OS MODULOS ═════════════════\r\n";
+        DWORD w = 0; WriteFile(hFile, sep, sizeof(sep) - 1, &w, nullptr);
+        for (DWORD i = 0; i < count && i < 500; i++) {
+            WCHAR name[MAX_PATH];
+            if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
+            dump_line_utf8(hFile, name);
+        }
+        CloseHandle(hFile);
+    }
+
+    // Priority 1: exact "lua54.dll" or "citizen-scripting-lua54.dll"
+    for (size_t i = 0; i < candN; i++) {
+        if (_wcsicmp(cands[i].base, L"lua54.dll") == 0 ||
+            _wcsicmp(cands[i].base, L"citizen-scripting-lua54.dll") == 0) {
+            MODULEINFO mi{};
+            GetModuleInformation(hProcess, cands[i].mod, &mi, sizeof(mi));
+            out->hModule  = cands[i].mod;
+            out->baseAddr = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+            out->size     = mi.SizeOfImage;
+            return true;
+        }
+    }
+    // Priority 2: any name containing lua54 or scripting-lua
+    for (size_t i = 0; i < candN; i++) {
+        if (w_contains_ci(cands[i].base, L"lua54") ||
+            w_contains_ci(cands[i].base, L"scripting-lua")) {
+            MODULEINFO mi{};
+            GetModuleInformation(hProcess, cands[i].mod, &mi, sizeof(mi));
+            out->hModule  = cands[i].mod;
+            out->baseAddr = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+            out->size     = mi.SizeOfImage;
+            return true;
+        }
+    }
     return false;
 }
 
