@@ -101,8 +101,34 @@ PayloadInfo BuildPayload() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  FindFiveMPid — process snapshot (unchanged)
+//  FindFiveMPid — process snapshot
+//
+//  v37: broad match. FiveM moderno usa nomes versionados por build:
+//    FiveM_GTAProcess.exe       (versao antiga sem build no nome)
+//    FiveM_b2060_GTAProcess.exe (versoes b2060+ carregam build no nome)
+//    FiveM_b2545_GTAProcess.exe
+//    FiveM_b3407_GTAProcess.exe
+//    ...
+//    FiveM_Diag_GTAProcess.exe  (variante de diagnostico)
+//    GTA5.exe                    (singleplayer / standalone)
+//
+//  Match: comeca com "FiveM" (case-insensitive) E contem "GTAProcess",
+//  ou e exatamente "GTA5.exe". Pula "FiveM.exe" (launcher) e
+//  "FiveMLauncher.exe".
 // ═══════════════════════════════════════════════════════════════
+static bool IsFiveMGameProcessName(const wchar_t* name) {
+    if (!name) return false;
+    if (_wcsicmp(name, L"GTA5.exe") == 0) return true;
+    // Must start with FiveM (case-insensitive)
+    if (_wcsnicmp(name, L"FiveM", 5) != 0) return false;
+    // Must contain "GTAProcess" (case-insensitive) — exclui launcher
+    const size_t len = wcslen(name);
+    for (size_t i = 0; i + 10 <= len; i++) {
+        if (_wcsnicmp(name + i, L"GTAProcess", 10) == 0) return true;
+    }
+    return false;
+}
+
 DWORD FindFiveMPid() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
@@ -113,8 +139,7 @@ DWORD FindFiveMPid() {
     DWORD pid = 0;
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, L"FiveM_GTAProcess.exe") == 0 ||
-                _wcsicmp(pe.szExeFile, L"GTA5.exe") == 0) {
+            if (IsFiveMGameProcessName(pe.szExeFile)) {
                 pid = pe.th32ProcessID;
                 break;
             }
