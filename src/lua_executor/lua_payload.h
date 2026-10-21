@@ -1,4 +1,7 @@
 #pragma once
+
+#include <string>
+
 // lua_payload.h — v37 Lua Payloads for FiveM
 //
 // v36 → v37 changelog:
@@ -362,6 +365,31 @@ end)()
 // kPreamble, which runs once per session.
 inline void Build(char* dst, size_t dstSize, const char* payload) {
     snprintf(dst, dstSize, "%s\n%s\n%s", kPreamble, kDetectAC, payload);
+}
+
+// ───── v34 compat helpers ─────
+#include <string>
+
+inline std::string Build(const std::string& payload) {
+    // Concatenate kPreamble + '\n' + kDetectAC + '\n' + payload
+    std::string out;
+    out.reserve(strlen(kPreamble) + strlen(kDetectAC) + payload.size() + 16);
+    out += kPreamble;
+    out += "\n";
+    out += kDetectAC;
+    out += "\n";
+    out += payload;
+    return out;
+}
+
+inline std::string BuildSpeedMult(float mult) {
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+        "if _G.__trainer_flags then _G.__trainer_flags.speed_mult = %.2f end\n",
+        (double)mult);
+    std::string lua(buf);
+    lua += kSpeedOn;
+    return Build(lua);
 }
 
 } // namespace LuaPayload

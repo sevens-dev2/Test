@@ -38,8 +38,14 @@
 #endif
 
 #include <windows.h>
+#include <winternl.h>   // NTSTATUS for v34 compat shims below
 #include <cstdint>
 #include <cstddef>
+#include <string>       // v34 compat: Execute(const std::string&) overload
+
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+#endif
 
 namespace LuaExecutor {
 
@@ -48,6 +54,7 @@ namespace LuaExecutor {
 // ═══════════════════════════════════════════════════════════════
 enum class ExecResult : int {
     OK = 0,
+    Ok = OK,                    // v34 compat (callers write ExecResult::Ok)
     ProcessNotFound,
     OpenProcessFailed,
     LuaDllNotFound,
@@ -254,5 +261,42 @@ bool FindLuaDll(HANDLE hProcess, LuaDllInfo* out);
 uintptr_t ResolveLuaDostring(HANDLE hProcess, const LuaDllInfo& dll);
 uintptr_t FindLuaState(HANDLE hProcess, const LuaDllInfo& dll);
 HANDLE    FindAlertableThread(DWORD pid);
+
+// ───── v34 backward-compat shims (do not remove — v34-era callers rely on them) ─────
+inline const auto& kShellcode = kShellcodePlain;  // alias for v34 name
+
+inline bool FindLuaDll(HANDLE hProcess, LPVOID* baseOut, SIZE_T* sizeOut) {
+    LuaDllInfo info{};
+    if (!FindLuaDll(hProcess, &info)) return false;
+    if (baseOut) *baseOut = reinterpret_cast<LPVOID>(info.baseAddr);
+    if (sizeOut) *sizeOut = static_cast<SIZE_T>(info.size);
+    return true;
+}
+
+// v34 callers do: LPVOID p = ResolveLuaDostring(h, base, size);  → return LPVOID
+inline LPVOID ResolveLuaDostring(HANDLE hProcess, LPVOID base, SIZE_T size) {
+    LuaDllInfo info{};
+    info.hModule  = nullptr;
+    info.baseAddr = reinterpret_cast<uintptr_t>(base);
+    info.size     = static_cast<DWORD>(size);
+    return reinterpret_cast<LPVOID>(ResolveLuaDostring(hProcess, info));
+}
+
+// v34 callers do: LPVOID state = FindLuaState(h);  → return LPVOID
+inline LPVOID FindLuaState(HANDLE hProcess) {
+    LuaDllInfo info{};
+    if (!FindLuaDll(hProcess, &info)) return nullptr;
+    uintptr_t a = FindLuaState(hProcess, info);
+    return reinterpret_cast<LPVOID>(a);
+}
+
+inline HANDLE FindAlertableThread(HANDLE /*hProcess*/, DWORD pid) {
+    return FindAlertableThread(pid);
+}
+
+// v34 callers do: Execute(LuaPayload::Build(script))  where Build returns std::string
+inline ExecResult Execute(const std::string& luaScript) {
+    return Execute(luaScript.c_str());
+}
 
 } // namespace LuaExecutor

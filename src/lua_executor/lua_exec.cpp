@@ -20,6 +20,7 @@
 #include "lua_exec.h"
 
 #include <windows.h>
+#include <winternl.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 
