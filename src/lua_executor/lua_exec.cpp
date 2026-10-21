@@ -344,49 +344,129 @@ uintptr_t ResolveLuaDostring(HANDLE hProcess, const LuaDllInfo& dll) {
         if (result) break;
     }
 
-    // v37 debug: dump the full export list to %TEMP%\fivem_exports.txt
-    // on every call so the user can inspect what their build actually
-    // exports (useful when ResolveLuaDostring returns 0 because the
-    // mainline target names were renamed/stripped).
-    WCHAR dumpPath[MAX_PATH];
-    DWORD tn = GetEnvironmentVariableW(L"TEMP", dumpPath, MAX_PATH);
-    if (tn > 0 && tn < MAX_PATH - 32) {
-        wcscat_s(dumpPath, MAX_PATH, L"\\fivem_exports.txt");
-        HANDLE hFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
-                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            char header[256];
-            int hl = snprintf(header, sizeof(header),
-                "FiveMMenu v37 ResolveLuaDostring — exports do DLL de Lua\r\n"
-                "DLL base=0x%016llX size=%u\r\n"
-                "Exports totais: %lu\r\n"
-                "Resolvido: %s (@ 0x%016llX)\r\n\r\n",
-                (unsigned long long)dll.baseAddr, (unsigned)dll.size,
-                (unsigned long)numNames,
-                resolved_name ? resolved_name : "NENHUM",
-                (unsigned long long)result);
-            DWORD w = 0;
-            WriteFile(hFile, header, hl, &w, nullptr);
-            for (DWORD i = 0; i < numNames; i++) {
-                char funcName[128]{};
-                ReadProcessMemory(hProcess, (LPCVOID)(dll.baseAddr + nameRVAs[i]),
-                                  funcName, sizeof(funcName) - 1, nullptr);
-                size_t len = strnlen(funcName, sizeof(funcName) - 1);
-                if (len == 0) continue;
-                funcName[len] = '\r';
-                if (len + 2 < sizeof(funcName)) {
-                    funcName[len + 1] = '\n';
-                    WriteFile(hFile, funcName, (DWORD)(len + 2), &w, nullptr);
-                }
-            }
-            CloseHandle(hFile);
-        }
-    }
-
     delete[] nameRVAs;
     delete[] funcRVAs;
     delete[] ordinals;
     return result;
+}
+
+// v37: dump exports of ANY DLL to the given file handle. Returns number
+// of exports written. Used by ScanAllCandidateDllsForLuaExports to let us
+// see what every scripting-related DLL in the process exposes.
+static DWORD DumpDllExports(HANDLE hProcess, uintptr_t base, HANDLE hFile) {
+    IMAGE_DOS_HEADER dos{};
+    if (!ReadProcessMemory(hProcess, (LPCVOID)base, &dos, sizeof(dos), nullptr)) return 0;
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+    IMAGE_NT_HEADERS64 nt{};
+    if (!ReadProcessMemory(hProcess, (LPCVOID)(base + dos.e_lfanew), &nt, sizeof(nt), nullptr)) return 0;
+    if (nt.Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    auto& expDir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (expDir.VirtualAddress == 0) return 0;
+
+    IMAGE_EXPORT_DIRECTORY exp{};
+    if (!ReadProcessMemory(hProcess, (LPCVOID)(base + expDir.VirtualAddress), &exp, sizeof(exp), nullptr)) return 0;
+    if (exp.NumberOfNames == 0) return 0;
+
+    auto* nameRVAs = new DWORD[exp.NumberOfNames];
+    ReadProcessMemory(hProcess, (LPCVOID)(base + exp.AddressOfNames),
+                      nameRVAs, exp.NumberOfNames * sizeof(DWORD), nullptr);
+
+    DWORD w = 0;
+    for (DWORD i = 0; i < exp.NumberOfNames; i++) {
+        char funcName[256]{};
+        ReadProcessMemory(hProcess, (LPCVOID)(base + nameRVAs[i]),
+                          funcName, sizeof(funcName) - 1, nullptr);
+        size_t len = strnlen(funcName, sizeof(funcName) - 1);
+        if (len == 0) continue;
+        if (len + 2 < sizeof(funcName)) {
+            funcName[len]     = '\r';
+            funcName[len + 1] = '\n';
+            WriteFile(hFile, funcName, (DWORD)(len + 2), &w, nullptr);
+        }
+    }
+
+    delete[] nameRVAs;
+    return exp.NumberOfNames;
+}
+
+// v37: scan every "lua"/"scripting"-related DLL in the process and
+// dump each one's export table to %TEMP%\fivem_exports.txt. Called
+// by ExecuteEx when the first ResolveLuaDostring fails, so the user
+// can send us ALL candidate exports in one file.
+void DumpAllCandidateExports(HANDLE hProcess) {
+    HMODULE mods[1024];
+    DWORD needed = 0;
+    if (!EnumProcessModulesEx(hProcess, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) {
+        if (!EnumProcessModules(hProcess, mods, sizeof(mods), &needed)) return;
+    }
+    DWORD count = needed / sizeof(HMODULE);
+
+    WCHAR dumpPath[MAX_PATH];
+    DWORD tn = GetEnvironmentVariableW(L"TEMP", dumpPath, MAX_PATH);
+    if (tn == 0 || tn >= MAX_PATH - 32) return;
+    wcscat_s(dumpPath, MAX_PATH, L"\\fivem_exports.txt");
+
+    HANDLE hFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    const char intro[] =
+        "FiveMMenu v37 — Dump de exports de todos os DLLs candidatos\r\n"
+        "Candidatos: nome contem 'lua', 'scripting' ou e um dos helpers listados.\r\n\r\n";
+    DWORD w = 0;
+    WriteFile(hFile, intro, sizeof(intro) - 1, &w, nullptr);
+
+    const WCHAR* extra_targets[] = {
+        L"citizen-scripting-core.dll",
+        L"scripting-gta.dll",
+        L"rage-scripting-five.dll",
+        L"citizen-scripting-lua.dll",
+        L"citizen-scripting-lua54.dll",
+        L"lua54.dll",
+        L"citizen-game-main.dll"
+    };
+
+    for (DWORD i = 0; i < count; i++) {
+        WCHAR name[MAX_PATH];
+        if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
+        WCHAR* base = wcsrchr(name, L'\\');
+        if (!base) base = name; else base++;
+
+        bool interesting = w_contains_ci(base, L"lua") ||
+                           w_contains_ci(base, L"scripting");
+        if (!interesting) {
+            for (const WCHAR* et : extra_targets) {
+                if (_wcsicmp(base, et) == 0) { interesting = true; break; }
+            }
+        }
+        if (!interesting) continue;
+
+        MODULEINFO mi{};
+        GetModuleInformation(hProcess, mods[i], &mi, sizeof(mi));
+        uintptr_t modBase = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+
+        char header[512];
+        int bl = WideCharToMultiByte(CP_UTF8, 0, base, -1, header, sizeof(header), nullptr, nullptr);
+        if (bl <= 0) continue;
+        char section[1024];
+        int sl = snprintf(section, sizeof(section),
+            "\r\n═════════════════════════════════════════════════════\r\n"
+            "DLL: %s\r\n"
+            "base=0x%016llX  size=%u\r\n"
+            "─── exports ───\r\n",
+            header, (unsigned long long)modBase, (unsigned)mi.SizeOfImage);
+        WriteFile(hFile, section, sl, &w, nullptr);
+
+        DWORD n = DumpDllExports(hProcess, modBase, hFile);
+        char tail[64];
+        int tl = snprintf(tail, sizeof(tail),
+            "─── total: %lu exports ───\r\n", (unsigned long)n);
+        WriteFile(hFile, tail, tl, &w, nullptr);
+    }
+
+    CloseHandle(hFile);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -607,8 +687,12 @@ ExecResult ExecuteEx(HANDLE hProcess, DWORD pid, const char* luaScript) {
         return ExecResult::LuaDllNotFound;
 
     uintptr_t pDostring = ResolveLuaDostring(hProcess, luaDll);
-    if (!pDostring)
+    if (!pDostring) {
+        // v37: on resolver failure, dump exports of EVERY candidate
+        // scripting DLL so we can see what else is around.
+        DumpAllCandidateExports(hProcess);
         return ExecResult::DostringNotFound;
+    }
 
     uintptr_t pLuaState = FindLuaState(hProcess, luaDll);
     if (!pLuaState)
