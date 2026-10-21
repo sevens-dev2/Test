@@ -283,8 +283,30 @@ uintptr_t ResolveLuaDostring(HANDLE hProcess, const LuaDllInfo& dll) {
     ReadProcessMemory(hProcess, (LPCVOID)(dll.baseAddr + exp.AddressOfNameOrdinals),
                       ordinals, numNames * sizeof(WORD), nullptr);
 
-    const char* targets[] = { "luaL_dostring", "luaL_loadstring" };
+    // v37: expanded target list. luaL_dostring is a MACRO in Lua 5.4
+    // (`loadstring || pcall`), so it's never exported. We try several
+    // candidates in priority order and take the first one found.
+    //
+    // Priority rationale:
+    //   luaL_dostring   — some custom builds export it as a function
+    //   luaL_loadstring — exists on vanilla Lua 5.4; needs lua_pcall after
+    //                     (shellcode currently expects a one-shot dostring;
+    //                      if only loadstring is found, user needs the
+    //                      "loadstring+pcall" shellcode variant — ping
+    //                      the author with the exports dump)
+    //   lua_pcall / lua_pcallk — fundamental, always exported
+    //   luaL_newstate  — proves the symbol table is readable
+    const char* targets[] = {
+        "luaL_dostring",
+        "luaL_loadstring",
+        "luaL_loadstringex",
+        "luaL_loadbufferx",
+        "luaL_loadbuffer",
+        "luaL_loadfilex",
+        "luaL_dofile"
+    };
     uintptr_t result = 0;
+    const char* resolved_name = nullptr;
 
     for (const char* target : targets) {
         for (DWORD i = 0; i < numNames; i++) {
@@ -294,10 +316,50 @@ uintptr_t ResolveLuaDostring(HANDLE hProcess, const LuaDllInfo& dll) {
             if (strcmp(funcName, target) == 0) {
                 WORD ord = ordinals[i];
                 result = dll.baseAddr + funcRVAs[ord];
+                resolved_name = target;
                 break;
             }
         }
         if (result) break;
+    }
+
+    // v37 debug: dump the full export list to %TEMP%\fivem_exports.txt
+    // on every call so the user can inspect what their build actually
+    // exports (useful when ResolveLuaDostring returns 0 because the
+    // mainline target names were renamed/stripped).
+    WCHAR dumpPath[MAX_PATH];
+    DWORD tn = GetEnvironmentVariableW(L"TEMP", dumpPath, MAX_PATH);
+    if (tn > 0 && tn < MAX_PATH - 32) {
+        wcscat_s(dumpPath, MAX_PATH, L"\\fivem_exports.txt");
+        HANDLE hFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            char header[256];
+            int hl = snprintf(header, sizeof(header),
+                "FiveMMenu v37 ResolveLuaDostring — exports do DLL de Lua\r\n"
+                "DLL base=0x%016llX size=%u\r\n"
+                "Exports totais: %lu\r\n"
+                "Resolvido: %s (@ 0x%016llX)\r\n\r\n",
+                (unsigned long long)dll.baseAddr, (unsigned)dll.size,
+                (unsigned long)numNames,
+                resolved_name ? resolved_name : "NENHUM",
+                (unsigned long long)result);
+            DWORD w = 0;
+            WriteFile(hFile, header, hl, &w, nullptr);
+            for (DWORD i = 0; i < numNames; i++) {
+                char funcName[128]{};
+                ReadProcessMemory(hProcess, (LPCVOID)(dll.baseAddr + nameRVAs[i]),
+                                  funcName, sizeof(funcName) - 1, nullptr);
+                size_t len = strnlen(funcName, sizeof(funcName) - 1);
+                if (len == 0) continue;
+                funcName[len] = '\r';
+                if (len + 2 < sizeof(funcName)) {
+                    funcName[len + 1] = '\n';
+                    WriteFile(hFile, funcName, (DWORD)(len + 2), &w, nullptr);
+                }
+            }
+            CloseHandle(hFile);
+        }
     }
 
     delete[] nameRVAs;
