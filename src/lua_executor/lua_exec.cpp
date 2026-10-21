@@ -681,16 +681,45 @@ ExecResult Execute(const char* luaScript) {
 //  NtQueueApcThread(ApcRoutine=regionB_entry, ApcArgument1=regionA_base).
 //  Shellcode's `mov rbx, rcx` lands rbx at regionA.
 // ═══════════════════════════════════════════════════════════════
-ExecResult ExecuteEx(HANDLE hProcess, DWORD pid, const char* luaScript) {
-    LuaDllInfo luaDll{};
-    if (!FindLuaDll(hProcess, &luaDll))
-        return ExecResult::LuaDllNotFound;
+// v37: aggressive debug — appends a line to C:\Users\Public\fivem_debug.log
+// (world-writable, no UAC needed). Used to prove each pipeline step runs.
+static void dbg_log(const char* msg) {
+    HANDLE h = CreateFileA("C:\\Users\\Public\\fivem_debug.log",
+                           FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME t; GetLocalTime(&t);
+    char line[1024];
+    int n = snprintf(line, sizeof(line), "[%02d:%02d:%02d.%03d] %s\r\n",
+                     t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, msg);
+    DWORD w = 0;
+    SetFilePointer(h, 0, nullptr, FILE_END);
+    WriteFile(h, line, (DWORD)n, &w, nullptr);
+    CloseHandle(h);
+}
 
+ExecResult ExecuteEx(HANDLE hProcess, DWORD pid, const char* luaScript) {
+    (void)luaScript;
+    char dbuf[256];
+    snprintf(dbuf, sizeof(dbuf), "ExecuteEx enter — pid=%lu hProcess=0x%p", pid, hProcess);
+    dbg_log(dbuf);
+
+    LuaDllInfo luaDll{};
+    dbg_log("FindLuaDll call");
+    bool okDll = FindLuaDll(hProcess, &luaDll);
+    snprintf(dbuf, sizeof(dbuf), "FindLuaDll result: ok=%d base=0x%llX size=%u",
+             okDll ? 1 : 0, (unsigned long long)luaDll.baseAddr, (unsigned)luaDll.size);
+    dbg_log(dbuf);
+    if (!okDll) { dbg_log("return LuaDllNotFound"); return ExecResult::LuaDllNotFound; }
+
+    dbg_log("ResolveLuaDostring call");
     uintptr_t pDostring = ResolveLuaDostring(hProcess, luaDll);
+    snprintf(dbuf, sizeof(dbuf), "ResolveLuaDostring result: 0x%llX", (unsigned long long)pDostring);
+    dbg_log(dbuf);
     if (!pDostring) {
-        // v37: on resolver failure, dump exports of EVERY candidate
-        // scripting DLL so we can see what else is around.
+        dbg_log("DumpAllCandidateExports call BEGIN");
         DumpAllCandidateExports(hProcess);
+        dbg_log("DumpAllCandidateExports call END — returning DostringNotFound");
         return ExecResult::DostringNotFound;
     }
 
