@@ -152,18 +152,32 @@ DWORD FindFiveMPid() {
 // ═══════════════════════════════════════════════════════════════
 //  FindLuaDll — citizen-scripting-lua54.dll / lua54.dll (unchanged)
 // ═══════════════════════════════════════════════════════════════
+// Case-insensitive substring search in wide string
+static bool w_contains_ci(const WCHAR* hay, const WCHAR* needle) {
+    if (!hay || !needle) return false;
+    size_t nlen = wcslen(needle);
+    if (nlen == 0) return true;
+    for (size_t i = 0; hay[i]; i++) {
+        if (_wcsnicmp(hay + i, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
 bool FindLuaDll(HANDLE hProcess, LuaDllInfo* out) {
-    HMODULE mods[512];
+    HMODULE mods[1024];
     DWORD needed = 0;
-    if (!EnumProcessModulesEx(hProcess, mods, sizeof(mods), &needed, LIST_MODULES_ALL))
-        return false;
+    if (!EnumProcessModulesEx(hProcess, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) {
+        // Fallback: try without LIST_MODULES_ALL (older behaviour / bitness mismatch)
+        if (!EnumProcessModules(hProcess, mods, sizeof(mods), &needed))
+            return false;
+    }
 
     DWORD count = needed / sizeof(HMODULE);
+
+    // Pass 1: exact name match (fastest, matches v34/known builds)
     for (DWORD i = 0; i < count; i++) {
         WCHAR name[MAX_PATH];
-        if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH))
-            continue;
-
+        if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
         WCHAR* base = wcsrchr(name, L'\\');
         if (!base) base = name; else base++;
 
@@ -177,6 +191,58 @@ bool FindLuaDll(HANDLE hProcess, LuaDllInfo* out) {
             return true;
         }
     }
+
+    // Pass 2: fuzzy match — any DLL whose BASENAME contains "lua54" or
+    // "scripting-lua" (covers builds where the DLL was renamed, e.g.
+    // "citizen-scripting-lua54-v2.dll", "scripting-lua54.dll", etc.)
+    for (DWORD i = 0; i < count; i++) {
+        WCHAR name[MAX_PATH];
+        if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
+        WCHAR* base = wcsrchr(name, L'\\');
+        if (!base) base = name; else base++;
+
+        if (w_contains_ci(base, L"lua54") ||
+            w_contains_ci(base, L"scripting-lua")) {
+            MODULEINFO mi{};
+            GetModuleInformation(hProcess, mods[i], &mi, sizeof(mi));
+            out->hModule  = mods[i];
+            out->baseAddr = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+            out->size     = mi.SizeOfImage;
+            return true;
+        }
+    }
+
+    // Nothing matched — dump the module list to %TEMP%\fivem_modules.txt
+    // so the user can send us the DLL name their build is actually using.
+    WCHAR dumpPath[MAX_PATH];
+    DWORD tn = GetEnvironmentVariableW(L"TEMP", dumpPath, MAX_PATH);
+    if (tn > 0 && tn < MAX_PATH - 32) {
+        wcscat_s(dumpPath, MAX_PATH, L"\\fivem_modules.txt");
+        HANDLE hFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            char header[128];
+            int hl = snprintf(header, sizeof(header),
+                "FiveMMenu v37 FindLuaDll — nenhum DLL de Lua localizado.\r\n"
+                "Modulos enumerados no processo FiveM (%lu total):\r\n\r\n", count);
+            DWORD w = 0;
+            WriteFile(hFile, header, hl, &w, nullptr);
+
+            for (DWORD i = 0; i < count && i < 500; i++) {
+                WCHAR name[MAX_PATH];
+                if (!GetModuleFileNameExW(hProcess, mods[i], name, MAX_PATH)) continue;
+                char buf[MAX_PATH * 2];
+                int bl = WideCharToMultiByte(CP_UTF8, 0, name, -1, buf, sizeof(buf) - 2, nullptr, nullptr);
+                if (bl > 0) {
+                    buf[bl - 1] = '\r';
+                    buf[bl]     = '\n';
+                    WriteFile(hFile, buf, bl + 1, &w, nullptr);
+                }
+            }
+            CloseHandle(hFile);
+        }
+    }
+
     return false;
 }
 
