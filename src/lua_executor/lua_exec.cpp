@@ -39,6 +39,28 @@ typedef NTSTATUS (NTAPI* pfnNtQueueApcThread)(
 
 namespace LuaExecutor {
 
+// Forward decl (defined later in this TU).
+void DumpAllCandidateExports(HANDLE hProcess);
+
+// v37: aggressive debug — appends a line to C:\Users\Public\fivem_debug.log
+// (world-writable, no UAC needed). Used to prove each pipeline step runs.
+// Defined inline so it's visible from every function in this translation
+// unit regardless of definition order.
+static inline void dbg_log(const char* msg) {
+    HANDLE h = CreateFileA("C:\\Users\\Public\\fivem_debug.log",
+                           FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME t; GetLocalTime(&t);
+    char line[1024];
+    int n = snprintf(line, sizeof(line), "[%02d:%02d:%02d.%03d] %s\r\n",
+                     t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, msg);
+    DWORD w = 0;
+    SetFilePointer(h, 0, nullptr, FILE_END);
+    WriteFile(h, line, (DWORD)n, &w, nullptr);
+    CloseHandle(h);
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  v37: BuildPayload — metamorphic variant selection + 8-byte key
 // ═══════════════════════════════════════════════════════════════
@@ -271,10 +293,17 @@ bool FindLuaDll(HANDLE hProcess, LuaDllInfo* out) {
 //  ResolveLuaDostring — remote PE parse (unchanged from v36)
 // ═══════════════════════════════════════════════════════════════
 uintptr_t ResolveLuaDostring(HANDLE hProcess, const LuaDllInfo& dll) {
+    char dmsg[256];
+    snprintf(dmsg, sizeof(dmsg), "ResolveLuaDostring enter — base=0x%llX size=%u",
+             (unsigned long long)dll.baseAddr, (unsigned)dll.size);
+    dbg_log(dmsg);
+
     IMAGE_DOS_HEADER dos{};
-    if (!ReadProcessMemory(hProcess, (LPCVOID)dll.baseAddr, &dos, sizeof(dos), nullptr))
+    if (!ReadProcessMemory(hProcess, (LPCVOID)dll.baseAddr, &dos, sizeof(dos), nullptr)) {
+        dbg_log("ResolveLuaDostring: RPM dos failed");
         return 0;
-    if (dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    }
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) { dbg_log("ResolveLuaDostring: bad DOS magic"); return 0; }
 
     IMAGE_NT_HEADERS64 nt{};
     uintptr_t ntAddr = dll.baseAddr + dos.e_lfanew;
@@ -347,6 +376,23 @@ uintptr_t ResolveLuaDostring(HANDLE hProcess, const LuaDllInfo& dll) {
     delete[] nameRVAs;
     delete[] funcRVAs;
     delete[] ordinals;
+
+    char rmsg[256];
+    snprintf(rmsg, sizeof(rmsg),
+             "ResolveLuaDostring result=0x%llX resolved_name=%s",
+             (unsigned long long)result,
+             resolved_name ? resolved_name : "NONE");
+    dbg_log(rmsg);
+
+    // v37: on resolver failure, dump exports of every candidate DLL in
+    // the process. Fires whether called via the main pipeline or the
+    // startup validation thread (lua_exec.h shim both route here).
+    if (!result) {
+        dbg_log("ResolveLuaDostring: triggering DumpAllCandidateExports");
+        DumpAllCandidateExports(hProcess);
+        dbg_log("ResolveLuaDostring: DumpAllCandidateExports returned");
+    }
+
     return result;
 }
 
@@ -681,22 +727,7 @@ ExecResult Execute(const char* luaScript) {
 //  NtQueueApcThread(ApcRoutine=regionB_entry, ApcArgument1=regionA_base).
 //  Shellcode's `mov rbx, rcx` lands rbx at regionA.
 // ═══════════════════════════════════════════════════════════════
-// v37: aggressive debug — appends a line to C:\Users\Public\fivem_debug.log
-// (world-writable, no UAC needed). Used to prove each pipeline step runs.
-static void dbg_log(const char* msg) {
-    HANDLE h = CreateFileA("C:\\Users\\Public\\fivem_debug.log",
-                           FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    SYSTEMTIME t; GetLocalTime(&t);
-    char line[1024];
-    int n = snprintf(line, sizeof(line), "[%02d:%02d:%02d.%03d] %s\r\n",
-                     t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, msg);
-    DWORD w = 0;
-    SetFilePointer(h, 0, nullptr, FILE_END);
-    WriteFile(h, line, (DWORD)n, &w, nullptr);
-    CloseHandle(h);
-}
+// (dbg_log is defined at the top of this file; see top for implementation.)
 
 ExecResult ExecuteEx(HANDLE hProcess, DWORD pid, const char* luaScript) {
     (void)luaScript;
