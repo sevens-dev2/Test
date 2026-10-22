@@ -1,395 +1,200 @@
 #pragma once
-
-#include <string>
-
-// lua_payload.h — v37 Lua Payloads for FiveM
+// lua_payload.h — v38 Native Dispatch Feature Table
 //
-// v36 → v37 changelog:
-//   1. Native hash obfuscation (__salt + __h_raw table):
-//      - Preamble installs _G.__salt = math.random uint32 and
-//        _G.__h_raw with every native hash XOR'd by __salt at
-//        installation time. The XOR is done ONCE during preamble
-//        execution; after that only _N('name') resolves hashes.
-//      - Features never embed literal 0x..... hex native hashes
-//        in their executed source — they go through _N(k).
-//   2. Sprint-gated speed hack (kSpeedOn):
-//      - Only applies the move-rate override while IsControlPressed
-//        for INPUT_SPRINT=21 is true.
-//      - Max 8000ms continuous active; 4000ms cooldown after a
-//        cycle. Looks like a human sprint pattern.
-//   3. Debug table sanitizer (kPreamble):
-//      - Overrides debug.getinfo / debug.traceback / debug.sethook
-//        to filter out our injected thread sources from the result.
-//      - Not a full lockdown — surface hiding against lightweight
-//        enumeration from script-level AC.
-//   4. All features still route through _G.__safe_invoke (v36 rate
-//      limiter preserved). All loops still Wait(500) when AC present.
-//   5. __trainer_flags metatable clamp on speed_mult preserved.
+// v37 shipped Lua payload strings that were injected and executed via
+// luaL_dostring. v38 pivots to direct native dispatch: each feature is
+// now a sequence of GTA native hash calls routed through
+// LuaExecutor::InvokeNative. There's no more Lua VM involvement.
+//
+// The old inline `const char* kSpeedOn = R"lua(...)";` constants are
+// preserved as empty placeholders so legacy loader code that references
+// them (e.g. button labels passed to ExecLuaAsync) still compiles —
+// nobody actually sends them anywhere.
+//
+// New: HashNative::* constants and feature functions that drive the
+// per-feature loops from the loader side.
+
+#include "lua_exec.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <atomic>
 
 namespace LuaPayload {
 
-// ── Preamble: flag table + safe-invoke + hash obfuscation + debug sanitizer ──
-inline const char* kPreamble = R"lua(
-if not _G.__trainer_flags then
-    local backing = {
-        speed       = false,
-        speed_mult  = 1.5,
-        god         = false,
-        jump        = false,
-        weapons     = false,
-        no_recoil   = false,
-        ac_present  = false,
-        last_jump   = 0,
-        boost_start = 0,
-        cooldown_start = 0
-    }
-    _G.__trainer_flags = setmetatable({}, {
-        __index = backing,
-        __newindex = function(_, k, v)
-            if k == 'speed_mult' then
-                v = tonumber(v) or 1.5
-                if v > 1.8 then v = 1.8 end
-                if v < 1.0 then v = 1.0 end
-            end
-            rawset(backing, k, v)
-        end,
-        __metatable = false
-    })
-end
+// ───────────── GTA V native hashes used by v38 features ─────────
+// (Standard CFX / community native-db values. Stable across GTA
+//  updates — these are the hashes the game's own scripts use.)
+namespace HashNative {
+    constexpr uint64_t PLAYER_PED_ID                 = 0xD80958FC74E988A6ULL;
+    constexpr uint64_t PLAYER_ID                     = 0x4F8644AF03D0E0D6ULL;
+    constexpr uint64_t GET_PLAYER_PED                = 0x43A66C31C68491C0ULL;
 
-if not _G.__safe_invoke then
-    local raw_H = Citizen.InvokeNative
-    local counter = {}
-    local window_start = (GetGameTimer and GetGameTimer()) or 0
-    _G.__safe_invoke = function(hash, ...)
-        local now = (GetGameTimer and GetGameTimer()) or 0
-        if (now - window_start) >= 1000 then
-            counter = {}
-            window_start = now
-        end
-        local c = counter[hash] or 0
-        if c >= 60 then
-            return 0
-        end
-        counter[hash] = c + 1
-        return raw_H(hash, ...)
-    end
-end
+    constexpr uint64_t SET_PED_MOVE_RATE_OVERRIDE    = 0x085BF80FA50A39D1ULL;
+    constexpr uint64_t SET_ENTITY_INVINCIBLE         = 0x3882114BDE571AD4ULL;
+    constexpr uint64_t SET_PED_CAN_RAGDOLL           = 0xB128377056A54E2AULL;
+    constexpr uint64_t SET_SUPER_JUMP_THIS_FRAME     = 0x57FFF03E423A4C0BULL;
+    constexpr uint64_t GIVE_WEAPON_TO_PED            = 0xBF0FD6E56C964FCBULL;
+    constexpr uint64_t SET_PED_AMMO                  = 0x14E56BC5B5DB6A19ULL;
+    constexpr uint64_t SET_CURRENT_PED_WEAPON        = 0xADF692B254977C0CULL;
+    constexpr uint64_t SET_PED_SHOOT_RATE            = 0x614DA022990752DCULL;
 
--- v37: salt + __h_raw hash obfuscation table.
--- Each native hash is XOR'd by __salt at install time. After this
--- block runs, _N(k) is the only path to a plaintext native hash.
-if not _G.__salt then
-    if math and math.randomseed then
-        math.randomseed(((GetGameTimer and GetGameTimer()) or 0) + (os and os.time and os.time() or 0))
-    end
-    _G.__salt = (math and math.random and math.random(1, 0x7FFFFFFF)) or 0x5A5A5A5A
-    local S = _G.__salt
-    _G.__h_raw = {
-        move_rate                   = 0xCF678B63F86F1D34 ~ S,
-        invinc                      = 0x733A643B5EEF9AD9 ~ S,
-        super_jump                  = 0x08DE2E9B2C43EDBD ~ S,
-        shoot_rate                  = 0x7CDDB33E0D7438AA ~ S,
-        ped_id                      = 0x6E31E993AB12CA6F ~ S,
-        give_weapon                 = 0xBF0FD6E56C964FCB ~ S,
-        set_ammo                    = 0x14E56BC5B5DB6A19 ~ S,
-        is_control_pressed          = 0xE2587F0659C6D119 ~ S,  -- IS_CONTROL_PRESSED stub hash
-        get_game_timer              = 0x9CD27B0045F8E3A2 ~ S   -- GET_GAME_TIMER stub hash
-    }
-    _G.__N = function(k) return _G.__h_raw[k] ~ _G.__salt end
-end
-
--- v37: debug sanitizer. Filters our thread entries from any ad-hoc
--- debug.getinfo scan. Surface hiding only.
-if not _G.__dbg_sanitized then
-    local marker = '__trainer'
-    if debug and debug.getinfo then
-        local real_getinfo = debug.getinfo
-        debug.getinfo = function(level, what)
-            local info = real_getinfo(level, what)
-            if info and info.source and type(info.source) == 'string' then
-                if string.find(info.source, marker, 1, true) then
-                    return nil
-                end
-                if string.find(info.source, 'trainer', 1, true) then
-                    return nil
-                end
-            end
-            return info
-        end
-    end
-    if debug and debug.traceback then
-        local real_tb = debug.traceback
-        debug.traceback = function(msg, lvl)
-            local tb = real_tb(msg, lvl)
-            if type(tb) == 'string' then
-                tb = string.gsub(tb, "[^\n]*trainer[^\n]*\n?", "")
-                tb = string.gsub(tb, "[^\n]*__trainer[^\n]*\n?", "")
-            end
-            return tb
-        end
-    end
-    if debug and debug.sethook then
-        local real_sh = debug.sethook
-        debug.sethook = function(hook, mask, count)
-            -- Silently swallow registry-scan sethook calls from unknown callers.
-            local info = (debug and debug.getinfo) and debug.getinfo(2, 'S')
-            if info and info.source and string.find(info.source, 'trainer', 1, true) then
-                return
-            end
-            return real_sh(hook, mask, count)
-        end
-    end
-    _G.__dbg_sanitized = true
-end
-)lua";
-
-inline const char* kSafeInvoke = R"lua(
-if not _G.__safe_invoke then
-    local raw_H = Citizen.InvokeNative
-    local counter = {}
-    local window_start = (GetGameTimer and GetGameTimer()) or 0
-    _G.__safe_invoke = function(hash, ...)
-        local now = (GetGameTimer and GetGameTimer()) or 0
-        if (now - window_start) >= 1000 then
-            counter = {}; window_start = now
-        end
-        local c = counter[hash] or 0
-        if c >= 60 then return 0 end
-        counter[hash] = c + 1
-        return raw_H(hash, ...)
-    end
-end
-)lua";
-
-// ── AC Detection (uses _N — no literal hashes in detect source) ──
-inline const char* kDetectAC = R"lua(
-(function()
-    local known = {
-        "icarusadvancedanticheat",
-        "vmenuac",
-        "txadmin",
-        "anticheat",
-        "advancedac"
-    }
-    _G.__trainer_flags.ac_present = false
-    if type(GetNumResources) ~= 'function' or type(GetResourceByFindIndex) ~= 'function' then
-        return
-    end
-    local n = GetNumResources()
-    for i = 0, n - 1 do
-        local nm = GetResourceByFindIndex(i)
-        if nm then
-            local lower = string.lower(nm)
-            for _, bad in ipairs(known) do
-                if string.find(lower, bad, 1, true) then
-                    _G.__trainer_flags.ac_present = true
-                    return
-                end
-            end
-        end
-    end
-end)()
-)lua";
-
-// ── Speed Hack (sprint-gated, 8s on / 4s cooldown) ──────────
-//   Only activates while player holds INPUT_SPRINT (control 21).
-//   After 8000ms continuous active, forces 4000ms cooldown.
-inline const char* kSpeedOn = R"lua(
-(function()
-    local _H = _G.__safe_invoke
-    local _N = _G.__N
-    _G.__trainer_flags.speed = true
-    _G.__trainer_flags.boost_start    = 0
-    _G.__trainer_flags.cooldown_start = 0
-    Citizen.CreateThread(function()
-        while _G.__trainer_flags.speed do
-            local now    = _H(_N('get_game_timer'))
-            if type(now) ~= 'number' then now = (GetGameTimer and GetGameTimer()) or 0 end
-            local sprint = _H(_N('is_control_pressed'), 0, 21)
-            local sprinting = (sprint == true) or (sprint == 1)
-
-            local bs = _G.__trainer_flags.boost_start    or 0
-            local cs = _G.__trainer_flags.cooldown_start or 0
-            local in_cooldown = (cs > 0) and ((now - cs) < 4000)
-
-            if sprinting and not in_cooldown then
-                if bs == 0 then
-                    _G.__trainer_flags.boost_start = now
-                    bs = now
-                end
-                if (now - bs) < 8000 then
-                    local ped = _H(_N('ped_id'))
-                    if ped and ped ~= 0 then
-                        _H(_N('move_rate'), ped, _G.__trainer_flags.speed_mult)
-                    end
-                else
-                    _G.__trainer_flags.cooldown_start = now
-                    _G.__trainer_flags.boost_start   = 0
-                end
-            else
-                if bs > 0 and (now - bs) >= 8000 then
-                    _G.__trainer_flags.cooldown_start = now
-                end
-                _G.__trainer_flags.boost_start = 0
-            end
-
-            Citizen.Wait(_G.__trainer_flags.ac_present and 500 or 0)
-        end
-    end)
-end)()
-)lua";
-
-inline const char* kSpeedOff = R"lua(
-(function()
-    local _H = _G.__safe_invoke
-    local _N = _G.__N
-    _G.__trainer_flags.speed = false
-    local ped = _H(_N('ped_id'))
-    if ped and ped ~= 0 then
-        _H(_N('move_rate'), ped, 1.0)
-    end
-end)()
-)lua";
-
-// ── God Mode (SET_PED_INVINCIBLE only) ──
-inline const char* kGodModeOn = R"lua(
-(function()
-    local _H = _G.__safe_invoke
-    local _N = _G.__N
-    _G.__trainer_flags.god = true
-    Citizen.CreateThread(function()
-        while _G.__trainer_flags.god do
-            local ped = _H(_N('ped_id'))
-            if ped and ped ~= 0 then
-                _H(_N('invinc'), ped, true)
-            end
-            Citizen.Wait(_G.__trainer_flags.ac_present and 500 or 0)
-        end
-    end)
-end)()
-)lua";
-
-inline const char* kGodModeOff = R"lua(
-(function()
-    local _H = _G.__safe_invoke
-    local _N = _G.__N
-    _G.__trainer_flags.god = false
-    local ped = _H(_N('ped_id'))
-    if ped and ped ~= 0 then
-        _H(_N('invinc'), ped, false)
-    end
-end)()
-)lua";
-
-// ── Super Jump (300ms cooldown gate; obfuscated hashes) ──
-inline const char* kSuperJumpOn = R"lua(
-(function()
-    local _H = _G.__safe_invoke
-    local _N = _G.__N
-    _G.__trainer_flags.jump = true
-    Citizen.CreateThread(function()
-        while _G.__trainer_flags.jump do
-            local now  = GetGameTimer()
-            local last = _G.__trainer_flags.last_jump or 0
-            if (now - last) >= 300 then
-                local pid = _H(_N('ped_id'))
-                if pid and pid ~= 0 then
-                    _H(_N('super_jump'), pid)
-                    _G.__trainer_flags.last_jump = now
-                end
-            end
-            Citizen.Wait(_G.__trainer_flags.ac_present and 500 or 0)
-        end
-    end)
-end)()
-)lua";
-
-inline const char* kSuperJumpOff = R"lua(
-(function()
-    _G.__trainer_flags.jump = false
-end)()
-)lua";
-
-// ── Give Weapons (safe-list; obfuscated give/ammo hashes) ──
-inline const char* kGiveAllWeapons = R"lua(
-(function()
-    local _H = _G.__safe_invoke
-    local _N = _G.__N
-    local WEAPONS = {
-        0x99B507EA,  -- WEAPON_KNIFE
-        0x1B06D571,  -- WEAPON_PISTOL
-        0x2BE6766B,  -- WEAPON_SMG
-        0x83BF0278,  -- WEAPON_CARBINERIFLE
-        0x05FC3C11,  -- WEAPON_SNIPERRIFLE
-        0x5EF9FEC4,  -- WEAPON_COMBATPISTOL
-        0x1D073A89   -- WEAPON_PUMPSHOTGUN
-    }
-    local ped = _H(_N('ped_id'))
-    if not ped or ped == 0 then return end
-    for _, wep in ipairs(WEAPONS) do
-        _H(_N('give_weapon'), ped, wep, 500, false, false)
-        _H(_N('set_ammo'),    ped, wep, 500)
-    end
-    _G.__trainer_flags.weapons = true
-end)()
-)lua";
-
-// ── No Recoil (SET_PED_SHOOT_RATE only; obfuscated hash) ──
-inline const char* kNoRecoilOn = R"lua(
-(function()
-    local _H = _G.__safe_invoke
-    local _N = _G.__N
-    _G.__trainer_flags.no_recoil = true
-    Citizen.CreateThread(function()
-        while _G.__trainer_flags.no_recoil do
-            local ped = _H(_N('ped_id'))
-            if ped and ped ~= 0 then
-                _H(_N('shoot_rate'), ped, 0.0)
-            end
-            Citizen.Wait(_G.__trainer_flags.ac_present and 500 or 0)
-        end
-    end)
-end)()
-)lua";
-
-inline const char* kNoRecoilOff = R"lua(
-(function()
-    _G.__trainer_flags.no_recoil = false
-end)()
-)lua";
-
-// Build concatenates kPreamble + kDetectAC + payload so every feature
-// inherits __trainer_flags, __safe_invoke, __salt, __h_raw, __N, and
-// the debug sanitizer. The literal native hashes appear ONLY inside
-// kPreamble, which runs once per session.
-inline void Build(char* dst, size_t dstSize, const char* payload) {
-    snprintf(dst, dstSize, "%s\n%s\n%s", kPreamble, kDetectAC, payload);
+    // Safe-list weapon hashes (small, same as v37)
+    constexpr uint32_t WEAPON_KNIFE          = 0x99B507EA;
+    constexpr uint32_t WEAPON_PISTOL         = 0x1B06D571;
+    constexpr uint32_t WEAPON_SMG            = 0x2BE6766B;
+    constexpr uint32_t WEAPON_CARBINERIFLE   = 0x83BF0278;
+    constexpr uint32_t WEAPON_SNIPERRIFLE    = 0x05FC3C11;
+    constexpr uint32_t WEAPON_COMBATPISTOL   = 0x5EF9FEC4;
+    constexpr uint32_t WEAPON_PUMPSHOTGUN    = 0x1D073A89;
 }
 
-// ───── v34 compat helpers ─────
-#include <string>
+// ───────────── Shared cached state for the per-feature threads ───
+struct SharedState {
+    std::atomic<uint64_t> cached_ped_id{0};
+    std::atomic<uint32_t> last_ped_refresh_ms{0};
+    std::atomic<float>    speed_mult{1.5f};
+    std::atomic<bool>     ac_present{false};
+};
+inline SharedState& Shared() {
+    static SharedState s;
+    return s;
+}
 
+// ───────────── Refresh cached PLAYER_PED_ID at most every 2s ─────
+inline uint64_t RefreshPedId() {
+    auto& S = Shared();
+    uint32_t now = GetTickCount();
+    if (S.cached_ped_id.load() != 0 &&
+        (now - S.last_ped_refresh_ms.load()) < 2000) {
+        return S.cached_ped_id.load();
+    }
+    uint64_t ped = 0;
+    LuaExecutor::ExecResult r =
+        LuaExecutor::InvokeNative(HashNative::PLAYER_PED_ID, nullptr, 0, &ped);
+    if (r == LuaExecutor::ExecResult::OK && ped != 0) {
+        S.cached_ped_id.store(ped);
+        S.last_ped_refresh_ms.store(now);
+    }
+    return ped;
+}
+
+// ───────────── Feature invocation helpers ────────────────────────
+// Each helper does ONE native dispatch per call. The loader spawns a
+// background thread per toggled feature that calls the helper every
+// 100-200ms with jitter (adhesive scan window ~250ms, so our shellcode
+// usually isn't resident when a scan tick lands).
+
+inline bool DoSpeedTick() {
+    uint64_t ped = RefreshPedId();
+    if (ped == 0) return false;
+    float m = Shared().speed_mult.load();
+    if (m < 1.0f) m = 1.0f;
+    if (m > 1.8f) m = 1.8f;  // server-side plausibility clamp
+    uint64_t speed_arg = 0;
+    *reinterpret_cast<float*>(&speed_arg) = m;
+    uint64_t args[2] = { ped, speed_arg };
+    return LuaExecutor::InvokeNative(
+        HashNative::SET_PED_MOVE_RATE_OVERRIDE, args, 2, nullptr)
+        == LuaExecutor::ExecResult::OK;
+}
+
+inline bool DoGodTick(bool enable) {
+    uint64_t ped = RefreshPedId();
+    if (ped == 0) return false;
+    uint64_t args[2] = { ped, enable ? 1ULL : 0ULL };
+    return LuaExecutor::InvokeNative(
+        HashNative::SET_ENTITY_INVINCIBLE, args, 2, nullptr)
+        == LuaExecutor::ExecResult::OK;
+}
+
+inline bool DoJumpTick() {
+    uint64_t pid_result = 0;
+    LuaExecutor::InvokeNative(HashNative::PLAYER_ID, nullptr, 0, &pid_result);
+    if (pid_result == 0) return false;
+    uint64_t args[1] = { pid_result };
+    return LuaExecutor::InvokeNative(
+        HashNative::SET_SUPER_JUMP_THIS_FRAME, args, 1, nullptr)
+        == LuaExecutor::ExecResult::OK;
+}
+
+inline bool DoNoRecoilTick() {
+    uint64_t ped = RefreshPedId();
+    if (ped == 0) return false;
+    uint64_t rate_arg = 0;
+    *reinterpret_cast<float*>(&rate_arg) = 0.0f;
+    uint64_t args[2] = { ped, rate_arg };
+    return LuaExecutor::InvokeNative(
+        HashNative::SET_PED_SHOOT_RATE, args, 2, nullptr)
+        == LuaExecutor::ExecResult::OK;
+}
+
+// Give weapons runs once (not a loop)
+inline bool DoGiveAllWeapons() {
+    uint64_t ped = RefreshPedId();
+    if (ped == 0) return false;
+    const uint32_t WEAPONS[] = {
+        HashNative::WEAPON_KNIFE,
+        HashNative::WEAPON_PISTOL,
+        HashNative::WEAPON_SMG,
+        HashNative::WEAPON_CARBINERIFLE,
+        HashNative::WEAPON_SNIPERRIFLE,
+        HashNative::WEAPON_COMBATPISTOL,
+        HashNative::WEAPON_PUMPSHOTGUN,
+    };
+    bool allOk = true;
+    for (uint32_t wep : WEAPONS) {
+        // GIVE_WEAPON_TO_PED(ped, weapon, ammo=500, equipAsCurrent=false, isAmmoLoaded=false)
+        uint64_t g_args[5] = { ped, (uint64_t)wep, 500ULL, 0ULL, 0ULL };
+        if (LuaExecutor::InvokeNative(
+                HashNative::GIVE_WEAPON_TO_PED, g_args, 5, nullptr)
+            != LuaExecutor::ExecResult::OK) allOk = false;
+        Sleep(30);  // 30ms spacing between weapon dispatches
+        uint64_t a_args[3] = { ped, (uint64_t)wep, 500ULL };
+        LuaExecutor::InvokeNative(HashNative::SET_PED_AMMO, a_args, 3, nullptr);
+        Sleep(30);
+    }
+    return allOk;
+}
+
+// ─── Legacy Lua payload placeholders (empty strings now) ─────────
+// Loader code may still reference these symbols by name. We keep them
+// as empty strings so compilation succeeds and the loader can log
+// labels/menu items without accidentally dispatching obsolete Lua.
+inline const char* kPreamble       = "";
+inline const char* kSafeInvoke     = "";
+inline const char* kDetectAC       = "";
+inline const char* kSpeedOn        = "";
+inline const char* kSpeedOff       = "";
+inline const char* kGodModeOn      = "";
+inline const char* kGodModeOff     = "";
+inline const char* kSuperJumpOn    = "";
+inline const char* kSuperJumpOff   = "";
+inline const char* kGiveAllWeapons = "";
+inline const char* kNoRecoilOn     = "";
+inline const char* kNoRecoilOff    = "";
+
+// Legacy v34 helper — Build(payload) returned a Lua string. v38 just
+// returns the same string back (loader code uses this to pass to
+// ExecLuaAsync; that goes through LuaExecutor::Execute(string) which is
+// now a probe for the native dispatch pipeline).
 inline std::string Build(const std::string& payload) {
-    // Concatenate kPreamble + '\n' + kDetectAC + '\n' + payload
-    std::string out;
-    out.reserve(strlen(kPreamble) + strlen(kDetectAC) + payload.size() + 16);
-    out += kPreamble;
-    out += "\n";
-    out += kDetectAC;
-    out += "\n";
-    out += payload;
-    return out;
+    return payload;
 }
 
 inline std::string BuildSpeedMult(float mult) {
-    char buf[128];
-    snprintf(buf, sizeof(buf),
-        "if _G.__trainer_flags then _G.__trainer_flags.speed_mult = %.2f end\n",
-        (double)mult);
-    std::string lua(buf);
-    lua += kSpeedOn;
-    return Build(lua);
+    Shared().speed_mult.store(mult);
+    return "/* v38: speed_mult set via LuaPayload::Shared() */";
+}
+
+// Legacy 3-arg Build used by main.cpp
+inline void Build(char* dst, size_t dstSize, const char* payload) {
+    if (dstSize == 0) return;
+    size_t n = payload ? strlen(payload) : 0;
+    if (n >= dstSize) n = dstSize - 1;
+    memcpy(dst, payload ? payload : "", n);
+    dst[n] = '\0';
 }
 
 } // namespace LuaPayload
